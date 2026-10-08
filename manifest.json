@@ -1,0 +1,74 @@
+{
+  "schemaVersion": 1,
+  "id": "pi.prompt-enhancement",
+  "name": "Prompt Enhancement",
+  "version": "1.0.0",
+  "description": "Rewrite the current Composer draft as a clearer prompt when you choose to run it.",
+  "i18n": {
+    "en": {
+      "name": "Prompt Enhancement",
+      "description": "Rewrite the current Composer draft as a clearer prompt when you choose to run it.",
+      "safetyNotes": "Sends the draft text to the selected model provider after you click the action. Does not read conversation history or file attachments."
+    },
+    "zh-CN": {
+      "name": "提示词增强",
+      "description": "按需将当前输入框草稿改写成更清晰的提示词。",
+      "safetyNotes": "点击操作后会把草稿文本发送给所选模型提供商；不会读取会话历史或文件附件。"
+    }
+  },
+  "main": "main.js",
+  "contributes": {
+    "composerTransforms": [
+      {
+        "id": "enhance",
+        "title": {
+          "en": "Enhance prompt",
+          "zh-CN": "增强提示词"
+        },
+        "undoTitle": {
+          "en": "Undo prompt enhancement",
+          "zh-CN": "撤销提示词增强"
+        }
+      }
+    ],
+    "settings": [
+      {
+        "key": "modelKey",
+        "title": "Enhancement model (provider/model; blank follows Composer)",
+        "type": "string",
+        "default": ""
+      },
+      {
+        "key": "thinkingLevel",
+        "title": "Reasoning effort",
+        "type": "select",
+        "default": "off",
+        "enum": [
+          { "label": "Off", "value": "off" },
+          { "label": "Minimal", "value": "minimal" },
+          { "label": "Low", "value": "low" },
+          { "label": "Medium", "value": "medium" },
+          { "label": "High", "value": "high" },
+          { "label": "Max", "value": "max" }
+        ]
+      },
+      {
+        "key": "userTemplate",
+        "title": "Custom user template (must include {{draft}}; blank uses the built-in template)",
+        "type": "string",
+        "multiline": true,
+        "default": ""
+      }
+    ]
+  },
+  "permissions": [
+    "composer.transform",
+    "agent.complete"
+  ],
+  "engines": {
+    "piDesktop": ">=0.1.0"
+  },
+  "activationEvents": [
+    "onStartup"
+  ]
+}
