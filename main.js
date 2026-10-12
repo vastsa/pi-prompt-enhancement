@@ -1,6 +1,8 @@
 const DRAFT_VARIABLE = "{{draft}}";
 const TEMPLATE_MAX_CHARS = 8000;
 const COMPLETE_TIMEOUT_MS = 60_000;
+const MODEL_CACHE_TTL_MS = 30_000;
+const MAX_MODEL_ROWS = 200;
 
 const SYSTEM_PROMPT = `You are a prompt-engineering expert who improves drafts for a coding assistant.
 
@@ -99,6 +101,142 @@ function stripDecorations(value) {
   return text.replace(LEADING_REWRITE_LABEL, "").trim();
 }
 
+/** The host's ready provider/model rows, cached briefly (`pi.models.list`). */
+let modelCache = { at: 0, models: [] };
+
+async function readyModels({ refresh = false } = {}) {
+  const now = Date.now();
+  if (!refresh && modelCache.at && now - modelCache.at < MODEL_CACHE_TTL_MS) {
+    return modelCache.models;
+  }
+  try {
+    const listed = await pi.models.list();
+    const models = Array.isArray(listed)
+      ? listed.filter((model) => model && typeof model.key === "string" && model.key.trim())
+      : [];
+    modelCache = { at: now, models };
+    return models;
+  } catch {
+    // The host core can be unreachable; keep whatever was listed last.
+    modelCache = { at: now, models: modelCache.models };
+    return modelCache.models;
+  }
+}
+
+function modelRow(model) {
+  const alias = typeof model.alias === "string" ? model.alias.trim() : "";
+  const label = typeof model.label === "string" ? model.label.trim() : "";
+  return {
+    key: model.key,
+    label: alias || label || String(model.modelId ?? model.key),
+    providerName: typeof model.providerName === "string" ? model.providerName : "",
+    isDefault: Boolean(model.isDefault),
+    supportsReasoning: Boolean(model.supportsReasoning),
+  };
+}
+
+/**
+ * The plugin's pin first, then the Composer's own model, then the host's
+ * default. A pin the host no longer reports (renamed provider, signed-out
+ * account) falls back instead of failing the enhance action.
+ */
+async function resolveModelKey(pinnedModelKey, composerModelKey) {
+  const models = await readyModels();
+  if (pinnedModelKey) {
+    if (!models.length || models.some((model) => model.key === pinnedModelKey)) return pinnedModelKey;
+  }
+  if (composerModelKey) return composerModelKey;
+  const fallback = models.find((model) => model.isDefault);
+  return fallback ? fallback.key : "";
+}
+
+/** The pin the settings hold, or `""` for "follow the Composer". */
+function pinnedModelKeyOf(settings) {
+  return typeof settings?.modelKey === "string" ? settings.modelKey.trim() : "";
+}
+
+/** The panel's own channels; the host relays what it does not implement itself. */
+const LOAD_CHANNEL = "settings.load";
+const SAVE_CHANNEL = "settings.save";
+const CONFIGURE_COMMAND = "enhancement.configure";
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "max"];
+
+/** A Composer button plus a palette command that opens the settings panel. */
+async function onLoad() {
+  await pi.commands.register({
+    id: CONFIGURE_COMMAND,
+    title: "Prompt Enhancement: Settings",
+    run: async () => {
+      await pi.ui.openPanel();
+    },
+  });
+}
+
+async function onUnload() {
+  await pi.commands.unregister(CONFIGURE_COMMAND);
+}
+
+/** The three settings the panel edits, as they should be stored. */
+function panelSettings(settings) {
+  const thinkingLevel = settings?.thinkingLevel;
+  return {
+    modelKey: pinnedModelKeyOf(settings),
+    thinkingLevel: THINKING_LEVELS.includes(thinkingLevel) ? thinkingLevel : "off",
+    userTemplate: typeof settings?.userTemplate === "string" ? settings.userTemplate : "",
+  };
+}
+
+/** What the panel sent, checked against the rules the transform relies on. */
+async function validatePanelPayload(payload) {
+  const modelKey = typeof payload?.modelKey === "string" ? payload.modelKey.trim() : "";
+  if (modelKey) {
+    const models = await readyModels({ refresh: true });
+    if (models.length && !models.some((model) => model.key === modelKey)) {
+      throw invalid("INVALID_ARGUMENT", "That model is not in the host's ready model list.");
+    }
+  }
+  const thinkingLevel =
+    typeof payload?.thinkingLevel === "string" && THINKING_LEVELS.includes(payload.thinkingLevel)
+      ? payload.thinkingLevel
+      : "off";
+  const sent = typeof payload?.userTemplate === "string" ? payload.userTemplate : "";
+  if (sent.length > TEMPLATE_MAX_CHARS) {
+    throw invalid("INVALID_ARGUMENT", "The custom template must be at most 8,000 characters.");
+  }
+  // The panel shows the built-in template, so sending it back unchanged means
+  // "use the built-in one" rather than "keep a second copy of it".
+  const userTemplate = sent.trim() === DEFAULT_USER_TEMPLATE.trim() ? "" : sent;
+  if (userTemplate.trim() && !userTemplate.includes(DRAFT_VARIABLE)) {
+    throw invalid("INVALID_ARGUMENT", "The custom template must include {{draft}}.");
+  }
+  return { modelKey, thinkingLevel, userTemplate };
+}
+
+/**
+ * The plugin panel's two channels. The host forwards every channel it does not
+ * implement itself to this hook, so the settings panel reaches the host's model
+ * list and the plugin's own settings only through this process.
+ */
+async function onPanelInvoke(channel, payload) {
+  if (channel === LOAD_CHANNEL) {
+    const settings = (await pi.plugin.getSettings()) ?? {};
+    const models = await readyModels({ refresh: true });
+    return {
+      settings: panelSettings(settings),
+      defaultTemplate: DEFAULT_USER_TEMPLATE,
+      models: models.slice(0, MAX_MODEL_ROWS).map(modelRow),
+      modelCount: models.length,
+      truncated: models.length > MAX_MODEL_ROWS,
+    };
+  }
+  if (channel === SAVE_CHANNEL) {
+    const next = await validatePanelPayload(payload);
+    await pi.plugin.setSettings(next);
+    return { settings: next };
+  }
+  throw invalid("UNSUPPORTED", `Unsupported prompt-enhancement panel operation: ${channel}`);
+}
+
 function invalid(code, message) {
   return Object.assign(new Error(message), { code });
 }
@@ -113,18 +251,19 @@ async function onComposerTransform(input) {
   }
 
   const settings = (await pi.plugin.getSettings()) ?? {};
-  const pinnedModelKey =
-    typeof settings.modelKey === "string" ? settings.modelKey.trim() : "";
-  const modelKey = pinnedModelKey || input.modelKey || "";
+  const pinnedModelKey = pinnedModelKeyOf(settings);
+  const modelKey = await resolveModelKey(
+    pinnedModelKey,
+    typeof input.modelKey === "string" ? input.modelKey.trim() : "",
+  );
   if (!modelKey) {
-    throw invalid("MODEL_NOT_CONFIGURED", "Select a Composer model or set an enhancement model in plugin settings.");
+    throw invalid(
+      "MODEL_NOT_CONFIGURED",
+      "Select a Composer model, or choose an enhancement model in Prompt Enhancement: Settings.",
+    );
   }
 
-  const thinkingLevel =
-    typeof settings.thinkingLevel === "string" &&
-    ["off", "minimal", "low", "medium", "high", "max"].includes(settings.thinkingLevel)
-      ? settings.thinkingLevel
-      : "off";
+  const thinkingLevel = panelSettings(settings).thinkingLevel;
   const result = await pi.agent.complete({
     modelKey,
     thinkingLevel,
@@ -140,4 +279,4 @@ async function onComposerTransform(input) {
   return enhanced;
 }
 
-module.exports = { onComposerTransform };
+module.exports = { onLoad, onUnload, onComposerTransform, onPanelInvoke };
